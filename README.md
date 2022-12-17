@@ -12,7 +12,7 @@ Target process id. Must have ptrace rights to it (required for accessing `/proc/
 
 **module**
 
-Module to inject, will be `dlopen`ed in the remote process. Should probably be a full path, because the remote LD_PATH is used otherwise for resolution.
+Module to inject, will be `dlopen`ed in the remote process. Should probably be a full path, because the remote LD_LIBRARY_PATH is used otherwise for resolution.
 
 ## Modification
 
