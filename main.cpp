@@ -19,6 +19,7 @@
 //  SOFTWARE.
 
 #define _LARGEFILE64_SOURCE
+#define _FILE_OFFSET_BITS 64
 
 #include <cstdint>
 #include <cassert>
@@ -32,8 +33,13 @@
 #include <fcntl.h>
 
 #include <array>
+#include <elf.h>
+#include <vector>
+#include <fstream>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
-#define VAR_NAME "obstack_alloc_failed_handler"
+#define VAR_NAME "timezone"
 #define FUN_NAME "malloc"
 
 __asm__(R"(
@@ -58,11 +64,12 @@ shell_first_patch_rip: # actually for previous instruction
 
   xor %edi, %edi      # addr     = 0
   mov $0x10000, %esi  # length   = 64k
+shell_alloclen_patch_rip: # actually for previous instruction
   mov $7, %edx        # prot     = PROT_READ | PROT_WRITE | PROT_EXEC
   mov $0x22, %r10d    # flags    = MAP_PRIVATE | MAP_ANON
   xor %r8, %r8        # fd       = NULL
   xor %r9, %r9        # offset   = 0
-  mov $9, %eax        # sys_mmap
+  mov $9, %eax        # __NR_mmap
   syscall
 
   orb $1, %al         # keep other threads spinning
@@ -80,17 +87,21 @@ shell_end:
 extern "C" void shell_begin();
 extern "C" void shell_first_patch_rip();
 extern "C" void shell_second_patch_rip();
+extern "C" void shell_alloclen_patch_rip();
 extern "C" void shell_end();
 
 constexpr static size_t shell_size = 0x50;
 
-void make_shell(uint8_t* p, void* target_addr, void* var_addr)
+void make_shell(uint8_t* p, void* target_addr, void* var_addr, int32_t alloclen)
 {
+  alloclen = (alloclen + 0x1000 - 1) / 0x1000 * 0x1000;
+
   const auto delta = (uint32_t)((uint8_t*)var_addr - (uint8_t*)target_addr);
 
   const auto og_begin = (uint8_t*)&shell_begin;
   const auto first_offset = (uint8_t*)&shell_first_patch_rip - og_begin;
   const auto second_offset = (uint8_t*)&shell_second_patch_rip - og_begin;
+  const auto alloclen_offset = (uint8_t*)&shell_alloclen_patch_rip - og_begin;
   const auto size = (uint8_t*)&shell_end - og_begin;
 
   assert(size <= shell_size);
@@ -99,29 +110,42 @@ void make_shell(uint8_t* p, void* target_addr, void* var_addr)
 
   *(uint32_t*)(p + first_offset - 5) += delta;
   *(uint32_t*)(p + second_offset - 4) += delta;
+  *(int32_t*)(p + alloclen_offset - 4) = alloclen;
 }
 
-struct shell2_params
+struct shell_raw_dlopen_params
 {
-  uint64_t p_dlopen;
+  void* p_dlopen;
+  void* p_oldfun;
   uint64_t flags;
-  uint64_t p_oldfun;
-  char path[256 - 24];
 };
 
 __asm__(R"(
-.globl shell2_begin
-.globl shell2_end
 
-.balign 0x100
-shell2_begin:
+.struct 0
+shell_raw_dlopen_params.p_dlopen:
+.space 8
+shell_raw_dlopen_params.p_oldfun:
+.space 8
+shell_raw_dlopen_params.flags:
+.space 8
+shell_raw_dlopen_params.path:
+
+
+.text
+
+.globl shell_raw_dlopen_begin
+.globl shell_raw_dlopen_end
+
+.balign 16
+
+shell_raw_dlopen_begin:
   .2byte 0x9066
 
-  mov shell2_end(%rip), %rax
-  mov shell2_end+8(%rip), %rsi
-  lea shell2_end+24(%rip), %rdi
+  mov shell_raw_dlopen_end+shell_raw_dlopen_params.flags(%rip), %rsi
+  lea shell_raw_dlopen_end+shell_raw_dlopen_params.path(%rip), %rdi
 
-  call *%rax
+  call *shell_raw_dlopen_end+shell_raw_dlopen_params.p_dlopen(%rip)
 
   pop %r9
   pop %r8
@@ -131,24 +155,155 @@ shell2_begin:
   pop %rdi
   pop %rax
 
-  jmp *shell2_end+16(%rip)
+  jmp *shell_raw_dlopen_end+shell_raw_dlopen_params.p_oldfun(%rip)
 
-.balign 0x100
-shell2_end:
+.balign 16
+
+shell_raw_dlopen_end:
   .byte 0xcc
 )");
 
 
-extern "C" void shell2_begin();
-extern "C" void shell2_end();
+extern "C" void shell_raw_dlopen_begin();
+extern "C" void shell_raw_dlopen_end();
 
-constexpr static size_t shell2_size = 0x100;
+struct shell_memfd_dlopen_params
+{
+  void* p_dlopen;
+  void* p_sprintf;
+  void* p_oldfun;
+  uint64_t flags;
+  uint64_t data_len;
+};
+
+__asm__(R"(
+.globl shell_memfd_dlopen_begin
+.globl shell_memfd_dlopen_end
+
+.struct 0
+shell_memfd_dlopen_params.p_dlopen:
+.space 8
+shell_memfd_dlopen_params.p_sprintf:
+.space 8
+shell_memfd_dlopen_params.p_oldfun:
+.space 8
+shell_memfd_dlopen_params.flags:
+.space 8
+shell_memfd_dlopen_params.data_len:
+.space 8
+shell_memfd_dlopen_params.data:
+
+
+.text
+
+.balign 16
+
+shell_memfd_dlopen_begin:
+  .2byte 0x9066
+
+  push %rbx
+  push %r12
+
+  lea shell_memfd_null(%rip), %rdi  # name  = ""
+  xor %esi, %esi                    # flags = 0
+  mov $319, %eax                    # __NR_memfd_create
+
+  syscall
+
+  mov %rax, %rbx
+
+  mov %rax, %rdi  # fd
+  lea shell_memfd_dlopen_end+shell_memfd_dlopen_params.data(%rip), %rsi     # buf
+  mov shell_memfd_dlopen_end+shell_memfd_dlopen_params.data_len(%rip), %rdx # count
+  mov $1, %eax    # __NR_write
+
+  syscall
+
+  lea shell_memfd_format_out(%rip), %rdi  # str
+  lea shell_memfd_format_str(%rip), %rsi  # format
+  mov %rbx, %rdx                          # fd
+
+  call *shell_memfd_dlopen_end+shell_memfd_dlopen_params.p_sprintf(%rip) # sprintf
+
+  lea shell_memfd_format_out(%rip), %rdi # filename
+  mov shell_memfd_dlopen_end+shell_memfd_dlopen_params.flags(%rip), %rsi # flag
+
+  call *shell_memfd_dlopen_end+shell_memfd_dlopen_params.p_dlopen(%rip) # dlopen
+
+  pop %r12
+  pop %rbx
+
+  pop %r9
+  pop %r8
+  pop %r10
+  pop %rdx
+  pop %rsi
+  pop %rdi
+  pop %rax
+
+  jmp *shell_memfd_dlopen_end+shell_memfd_dlopen_params.p_oldfun(%rip)
+
+shell_memfd_format_str:
+  .ascii "/proc/self/fd/%lu"
+shell_memfd_null:
+  .byte 0
+shell_memfd_format_out:
+  .fill 32, 1, 0
+
+.balign 16
+
+shell_memfd_dlopen_end:
+  .byte 0xcc
+)");
+
+
+extern "C" void shell_memfd_dlopen_begin();
+extern "C" void shell_memfd_dlopen_end();
+
+struct shell_raw_shellcode_params
+{
+  void* p_oldfun;
+  uint64_t _padding;
+};
+
+__asm__(R"(
+.globl shell_raw_shellcode_begin
+.globl shell_raw_shellcode_end
+
+
+.balign 16
+
+shell_raw_shellcode_begin:
+  .2byte 0x9066
+
+  call shell_raw_shellcode_end+16
+
+  pop %r9
+  pop %r8
+  pop %r10
+  pop %rdx
+  pop %rsi
+  pop %rdi
+  pop %rax
+
+  jmp *shell_raw_shellcode_end(%rip)
+
+.balign 16
+
+shell_raw_shellcode_end:
+  .byte 0xcc
+)");
+
+
+extern "C" void shell_raw_shellcode_begin();
+extern "C" void shell_raw_shellcode_end();
+
 
 class remote_mem
 {
   int f;
 public:
-  remote_mem(unsigned long pid) : f(-1)
+  explicit remote_mem(unsigned long pid) : f(-1)
   {
     char name[32];
     snprintf(name, sizeof(name), "/proc/%lu/mem", pid);
@@ -156,49 +311,167 @@ public:
     f = open(name, O_RDWR | O_LARGEFILE);
   }
 
-  [[nodiscard]] int fd() const
+  ~remote_mem()
+  {
+    if (f != -1)
+      close(f);
+  }
+
+  int fd() const
   {
     return f;
   }
 
-  void read_mem(void* addr, void* buf, size_t len) const
+  bool good() const
   {
-    lseek64(f, (int64_t)addr, SEEK_SET);
-    read(f, buf, len);
+    return f != -1;
   }
 
-  void write_mem(void* addr, const void* buf, size_t len) const
+  ssize_t read_mem(void* addr, void* buf, size_t len) const
   {
-    lseek64(f, (int64_t)addr, SEEK_SET);
-    write(f, buf, len);
+    return pread(f, buf, len, (int64_t)addr);
   }
 
-  template<typename T>
-  void read_mem(void* addr, T& t) const
+  ssize_t write_mem(void* addr, const void* buf, size_t len) const
   {
-    read_mem(addr, &t, sizeof(T));
+    return pwrite(f, buf, len, (int64_t)addr);
   }
 
-  template<typename T>
-  void write_mem(void* addr, const T& t) const
+  ssize_t write_code(void* addr, const void* buf, size_t len) const
   {
-    write_mem(addr, &t, sizeof(T));
-  }
-
-  template<typename T>
-  void write_code(void* addr, const T& t) const
-  {
+    if (len <= 2)
+    {
+      return write_mem(addr, buf, len);
+    }
     constexpr uint16_t ebfe = 0xfeeb;
-    write_mem(addr, ebfe);
+    if (!write_mem(addr, ebfe))
+      return 0;
     // sleep 100ms - wait for any currently ongoing calls to finish
     usleep(100000);
-    write_mem((uint8_t*)addr + 2, (char*)&t + 2, sizeof(t) - 2);
-    write_mem(addr, (char*)&t, 2);
+    if (!write_mem((uint8_t*)addr + 2, (char*)buf + 2, len - 2))
+      return 0;
+    return write_mem(addr, (char*)buf, 2);
+  }
+
+  template<typename T>
+  ssize_t read_mem(void* addr, T& t) const
+  {
+    return read_mem(addr, &t, sizeof(T));
+  }
+
+  template<typename T>
+  ssize_t write_mem(void* addr, const T& t) const
+  {
+    return write_mem(addr, &t, sizeof(T));
+  }
+
+  template<typename T>
+  ssize_t write_code(void* addr, const T& t) const
+  {
+    return write_code(addr, &t, sizeof(T));
   }
 };
 
-void* get_remote_lib(unsigned long pid, const char* path_substr)
+
+void* remote_dlsym(remote_mem& mem, void* elf, const char* name)
 {
+  Elf64_Ehdr elfh{};
+  if (!mem.read_mem(elf, elfh))
+    return nullptr;
+  if (0 != memcmp(elfh.e_ident, ELFMAG, SELFMAG))
+  {
+    return nullptr;
+  }
+  size_t dynrva = 0;
+  size_t dynvsz = 0;
+  for (size_t i = 0; i < elfh.e_phnum; ++i)
+  {
+    Elf64_Phdr phdr{};
+    if (!mem.read_mem((char*)elf + elfh.e_phoff + i * elfh.e_phentsize, phdr))
+      return nullptr;
+    if (phdr.p_type != PT_DYNAMIC)
+      continue;
+    dynrva = phdr.p_vaddr;
+    dynvsz = phdr.p_memsz;
+  }
+  if (!dynrva || !dynvsz)
+    return nullptr;
+  uintptr_t symtab = 0;
+  uintptr_t strtab = 0;
+  uintptr_t syment = 0;
+  for (size_t i = 0; i < dynvsz; i += sizeof(Elf64_Dyn))
+  {
+    Elf64_Dyn dyn{};
+    if (!mem.read_mem((char*)elf + dynrva + i, dyn))
+      return nullptr;
+    if (dyn.d_tag == DT_STRTAB)
+      strtab = dyn.d_un.d_ptr;
+    if (dyn.d_tag == DT_SYMTAB)
+      symtab = dyn.d_un.d_ptr;
+    if (dyn.d_tag == DT_SYMENT)
+      syment = dyn.d_un.d_val;
+  }
+  if (!symtab || !strtab || !syment)
+    return nullptr;
+
+  // this is actually incorrect
+  if (symtab < (uintptr_t)elf)
+    symtab += (uintptr_t)elf;
+  if (strtab < (uintptr_t)elf)
+    strtab += (uintptr_t)elf;
+
+  char namecpy[256];
+  const auto namebuflen = std::min(strlen(name) + 1, (size_t)256);
+
+  for (size_t i = symtab; i < strtab; i += syment)
+  {
+    Elf64_Sym sym{};
+    if (!mem.read_mem((void*)i, sym))
+      return nullptr;
+    if (!sym.st_name || !sym.st_value)
+      continue;
+    if (!mem.read_mem((char*)strtab + sym.st_name, namecpy, namebuflen))
+      continue;
+    namecpy[255] = 0;
+    if (0 == strcmp(namecpy, name))
+      return (char*)elf + sym.st_value;
+  }
+  return nullptr;
+}
+
+struct libc_syms
+{
+  void* var; // VAR_NAME
+  void* fun; // FUN_NAME
+  void* p_dlopen;
+  void* p_sprintf;
+};
+
+bool is_remote_libc(remote_mem& mem, void* maybe_libc, libc_syms& out)
+{
+  libc_syms syms{};
+  syms.var = remote_dlsym(mem, maybe_libc, VAR_NAME);
+  if (!syms.var)
+    return false;
+  syms.fun = remote_dlsym(mem, maybe_libc, FUN_NAME);
+  if (!syms.fun)
+    return false;
+  syms.p_dlopen = remote_dlsym(mem, maybe_libc, "dlopen");
+  if (!syms.p_dlopen)
+    syms.p_dlopen = remote_dlsym(mem, maybe_libc, "__libc_dlopen_mode");
+  if (!syms.p_dlopen)
+    return false;
+  syms.p_sprintf = remote_dlsym(mem, maybe_libc, "sprintf");
+  if (!syms.p_sprintf)
+    return false;
+  out = syms;
+  return true;
+}
+
+
+void* get_remote_libc(remote_mem& mem, unsigned long pid, libc_syms& syms)
+{
+  syms = {};
   char name[32];
   snprintf(name, sizeof(name), "/proc/%lu/maps", pid);
   name[31] = 0;
@@ -210,11 +483,10 @@ void* get_remote_lib(unsigned long pid, const char* path_substr)
   void* base = nullptr;
   while (fgets(line, sizeof(line), f))
   {
-    if (!strstr(line, path_substr))
-      continue;
-
     uint64_t begin, end;
-    if (2 == sscanf(line, "%lx-%lx ", &begin, &end))
+    if (2 != sscanf(line, "%lx-%lx ", &begin, &end))
+      continue;
+    if (is_remote_libc(mem, (void*)begin, syms))
     {
       base = (void*)begin;
       break;
@@ -224,109 +496,154 @@ void* get_remote_lib(unsigned long pid, const char* path_substr)
   return base;
 }
 
-void* translate_address(unsigned long pid, void* addr)
+static std::pair<const void*, size_t> map_file_for_read(const char* path)
 {
-  Dl_info info{};
-  if (!dladdr(addr, &info))
-    return nullptr;
+  const auto fd = open(path, O_RDONLY);
+  if (fd == -1)
+    return {};
+  struct stat statbuf{};
+  if (-1 == fstat(fd, &statbuf))
+    return {};
+  const auto p = mmap(nullptr, statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if ((void*)-1 == p)
+    return {};
+  return { p, statbuf.st_size };
+}
 
-  char name[32];
-  snprintf(name, sizeof(name), "/proc/%u/maps", getpid());
-  name[31] = 0;
-  const auto f = fopen(name, "r");
-  if (!f)
-    return nullptr;
-
-  char line[512];
-  const char* modname = nullptr;
-  while (fgets(line, sizeof(line), f))
+std::pair<const uint8_t*, size_t> make_shell_2(unsigned long mode, const char* module, const libc_syms& syms)
+{
+  size_t size;
+  uint8_t* ptr;
+  if (mode == 1)
   {
-    uint64_t begin, end;
-    if (2 == sscanf(line, "%lx-%lx ", &begin, &end))
-    {
-      if ((uint64_t)addr >= begin && (uint64_t)addr < end)
-      {
-        modname = strchr(line, '/');
-        break;
-      }
-    }
-  }
-  fclose(f);
-  if (!modname)
-    return nullptr;
 
-  const auto remote = get_remote_lib(pid, modname);
-  if (!remote)
-    return nullptr;
-  return (char*)addr - (char*)info.dli_fbase + (char*)remote;
+    shell_raw_dlopen_params p{};
+    p.p_dlopen = syms.p_dlopen;
+    p.p_oldfun = syms.fun;
+    p.flags = RTLD_NOW;
+
+    const auto size_shell = (uint8_t*)&shell_raw_dlopen_end - (uint8_t*)&shell_raw_dlopen_begin;
+    const auto size_params = sizeof(shell_raw_dlopen_params);
+    const auto size_data = strlen(module) + 1;
+    size = size_shell + size_params + size_data;
+    ptr = (uint8_t*)malloc(size);
+    memcpy(ptr, (uint8_t*)&shell_raw_dlopen_begin, size_shell);
+    memcpy(ptr + size_shell, &p, size_params);
+    memcpy(ptr + size_shell + size_params, module, size_data);
+  }
+  else if (mode == 2)
+  {
+    const auto file = map_file_for_read(module);
+    if (!file.first)
+    {
+      printf("Invalid file: %d\n", errno);
+      exit(-EINVAL);
+    }
+
+    shell_memfd_dlopen_params p{};
+    p.p_dlopen = syms.p_dlopen;
+    p.p_oldfun = syms.fun;
+    p.p_sprintf = syms.p_sprintf;
+    p.flags = RTLD_NOW;
+    p.data_len = file.second;
+
+    const auto size_shell = (uint8_t*)&shell_memfd_dlopen_end - (uint8_t*)&shell_memfd_dlopen_begin;
+    const auto size_params = sizeof(shell_memfd_dlopen_params);
+    const auto size_data = file.second;
+    size = size_shell + size_params + size_data;
+    ptr = (uint8_t*)malloc(size);
+    memcpy(ptr, (uint8_t*)&shell_memfd_dlopen_begin, size_shell);
+    memcpy(ptr + size_shell, &p, size_params);
+    memcpy(ptr + size_shell + size_params, file.first, size_data);
+  }
+  else if (mode == 3)
+  {
+    const auto file = map_file_for_read(module);
+    if (!file.first)
+    {
+      printf("Invalid file: %d\n", errno);
+      exit(-EINVAL);
+    }
+
+    shell_raw_shellcode_params p{};
+    p.p_oldfun = syms.fun;
+
+    const auto size_shell = (uint8_t*)&shell_raw_shellcode_end - (uint8_t*)&shell_raw_shellcode_begin;
+    const auto size_params = sizeof(shell_raw_shellcode_params);
+    const auto size_data = file.second;
+    size = size_shell + size_params + size_data;
+    ptr = (uint8_t*)malloc(size);
+    memcpy(ptr, (uint8_t*)&shell_raw_shellcode_begin, size_shell);
+    memcpy(ptr + size_shell, &p, size_params);
+    memcpy(ptr + size_shell + size_params, file.first, size_data);
+  }
+  else
+  {
+    puts("Invalid mode");
+    exit(-EINVAL);
+  }
+  return { ptr, size };
 }
 
 int main(int argc, char** argv)
 {
-  if (argc < 3)
+  if (argc < 4)
   {
-    fputs("Usage: linux_injector <pid> <module>", stderr);
+    fputs("Usage: linux_injector <mode> <pid> <file>\n", stderr);
+    fputs("  Mode 1: normal dlopen\n", stderr);
+    fputs("  Mode 2: memfd + dlopen (for injecting into containers)\n", stderr);
+    fputs("  Mode 3: raw shellcode\n", stderr);
     return -EINVAL;
   }
 
-  const auto remote_pid = strtoul(argv[1], nullptr, 10);
+  const auto mode = strtoul(argv[1], nullptr, 10);
+  const auto remote_pid = strtoul(argv[2], nullptr, 10);
+  const auto file = argv[3];
   printf("Injecting into %lu\n", remote_pid);
-
-  const auto local_var = dlsym(RTLD_DEFAULT, VAR_NAME);
-  const auto local_fun = dlsym(RTLD_DEFAULT, FUN_NAME);
-  auto local_dlopen = dlsym(RTLD_DEFAULT, "__libc_dlopen_mode");
-  if (!local_dlopen)
-    local_dlopen = dlvsym(RTLD_DEFAULT, "dlopen", "GLIBC_2.2.5");
-
-  if (!local_var || !local_fun || !local_dlopen)
-  {
-    fputs("Cannot find local symbols!", stderr);
-    return -EFAULT;
-  }
-
-  const auto remote_var = (uint8_t*)translate_address(remote_pid, local_var);
-  const auto remote_fun = (uint8_t*)translate_address(remote_pid, local_fun);
-  const auto remote_dlopen = (uint8_t*)translate_address(remote_pid, local_dlopen);
-
-  if (!remote_var || !remote_fun || !remote_dlopen)
-  {
-    fputs("Cannot find remote symbols!", stderr);
-    return -EFAULT;
-  }
 
   remote_mem mem{ remote_pid };
 
-  if (mem.fd() == -1)
+  if (!mem.good())
   {
-    fputs("Cannot open remote memory!", stderr);
+    fputs("Cannot open remote memory!\n", stderr);
     return -EACCES;
   }
 
-  puts("Starting injection...");
+  libc_syms syms{};
+  const auto libc = get_remote_libc(mem, remote_pid, syms);
+  if (!libc)
+  {
+    fputs("Cannot find suitable remote libc!\n", stderr);
+    return -EFAULT;
+  }
+
+  const auto shell_2 = make_shell_2(mode, file, syms);
+
+  printf("Remote libc: %p. Starting injection...\n", libc);
 
   std::array<uint8_t, shell_size> old_code{};
-  mem.read_mem(remote_fun, old_code);
+  mem.read_mem(syms.fun, old_code);
   void* old_var{};
-  mem.read_mem(remote_var, old_var);
+  mem.read_mem(syms.var, old_var);
 
   uintptr_t new_var = 0;
-  mem.write_mem(remote_var, new_var);
-  mem.read_mem(remote_var, new_var);
+  mem.write_mem(syms.var, new_var);
+  mem.read_mem(syms.var, new_var);
   if (new_var != 0)
   {
-    fputs("Sanity check failed!", stderr);
+    fputs("Sanity check failed!\n", stderr);
     return -EACCES;
   }
 
   std::array<uint8_t, shell_size> shell_code{};
-  make_shell(shell_code.data(), remote_fun, remote_var);
+  make_shell(shell_code.data(), syms.fun, syms.var, (int32_t)shell_2.second);
 
-  mem.write_code(remote_fun, shell_code);
+  mem.write_code(syms.fun, shell_code);
 
   puts("Wrote shellcode, waiting for it to trigger.");
 
   do
-    mem.read_mem(remote_var, new_var);
+    mem.read_mem(syms.var, new_var);
   while (!((new_var & 1) && (new_var & ~(uintptr_t)1)));
 
   new_var &= ~(uintptr_t)1;
@@ -334,25 +651,15 @@ int main(int argc, char** argv)
   printf("Triggered, new executable memory at %lx\n", new_var);
 
   constexpr uint16_t ebfe = 0xfeeb;
-  mem.write_mem(remote_fun, ebfe);
+  mem.write_mem(syms.fun, ebfe);
 
   // sleep 100ms
   usleep(100000);
 
-  mem.write_mem(remote_var, old_var);
-  mem.write_code(remote_fun, old_code);
+  mem.write_mem(syms.var, old_var);
+  mem.write_code(syms.fun, old_code);
 
-  shell2_params params{};
-
-  params.p_dlopen = (uint64_t)remote_dlopen;
-  params.p_oldfun = (uint64_t)remote_fun;
-  params.flags = RTLD_NOW;
-  strcpy(params.path, argv[2]);
-
-  mem.write_mem((void*)(new_var + shell2_size), params);
-  std::array<uint8_t, shell2_size> shell2_code{};
-  memcpy(shell2_code.data(), (uint8_t*)&shell2_begin, (uint8_t*)&shell2_end - (uint8_t*)&shell2_begin);
-  mem.write_code((void*)new_var, shell2_code);
+  mem.write_code((void*)new_var, shell_2.first, shell_2.second);
 
   puts("Done!");
 
